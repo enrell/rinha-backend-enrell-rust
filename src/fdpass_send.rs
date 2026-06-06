@@ -8,6 +8,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
 
+const MSG_NOSIGNAL: c_int = 0x4000;
+
 unsafe extern "C" {
     fn sendmsg(fd: c_int, msg: *const Msghdr, flags: c_int) -> isize;
 }
@@ -39,7 +41,7 @@ pub fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
     };
 
     loop {
-        let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, 0) };
+        let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, MSG_NOSIGNAL) };
         if sent >= 0 {
             return Ok(());
         }

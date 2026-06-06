@@ -56,10 +56,11 @@ const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
 const EPOLLRDHUP: u32 = 0x2000;
+const MSG_NOSIGNAL: c_int = 0x4000;
 const IPPROTO_TCP: c_int = 6;
 const TCP_NODELAY: c_int = 1;
 const TCP_QUICKACK: c_int = 12;
-const MAX_CLIENTS: usize = 128;
+const DEFAULT_MAX_CLIENTS: usize = 1024;
 const TAG_LISTENER: u64 = 1 << 63;
 const TAG_CONTROL: u64 = TAG_LISTENER | (1 << 62);
 
@@ -107,7 +108,7 @@ unsafe extern "C" {
     fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent) -> c_int;
     fn epoll_wait(epfd: c_int, events: *mut EpollEvent, maxevents: c_int, timeout: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+    fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
     fn close(fd: c_int) -> c_int;
     fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
 }
@@ -122,8 +123,14 @@ fn main() {
     unsafe { INDEX = Box::into_raw(Box::new(Index::load(&data_dir))); }
     eprintln!("Index loaded: {} vectors", get_index().count);
 
-    let mut pool: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
-    for _ in 0..MAX_CLIENTS {
+    let max_clients = std::env::var("MAX_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CLIENTS);
+    assert!(max_clients <= u16::MAX as usize, "MAX_CLIENTS too large");
+
+    let mut pool: Vec<Client> = Vec::with_capacity(max_clients);
+    for _ in 0..max_clients {
         pool.push(Client {
             fd: -1,
             buf: [0u8; BUF_CAP],
@@ -134,7 +141,7 @@ fn main() {
         });
     }
     let pool: &'static mut [Client] = pool.leak();
-    let mut free_list: Vec<u16> = (0..MAX_CLIENTS as u16).rev().collect();
+    let mut free_list: Vec<u16> = (0..max_clients as u16).rev().collect();
 
     if let Ok(path) = std::env::var("FD_PASS_PATH") {
         run_fd_pass(&path, pool, &mut free_list);
@@ -191,7 +198,7 @@ fn run_fd_pass(path: &str, pool: &mut [Client], free_list: &mut Vec<u16>) {
             }
 
             let idx = data as usize;
-            if idx >= MAX_CLIENTS {
+            if idx >= pool.len() {
                 continue;
             }
 
@@ -205,8 +212,11 @@ fn run_fd_pass(path: &str, pool: &mut [Client], free_list: &mut Vec<u16>) {
                 let fd = pool[idx].fd;
                 let new_events = client_events(&pool[idx]);
                 if new_events != pool[idx].last_events {
-                    pool[idx].last_events = new_events;
-                    epoll_mod(epoll, fd, idx as u64, new_events);
+                    if epoll_mod(epoll, fd, idx as u64, new_events) {
+                        pool[idx].last_events = new_events;
+                    } else {
+                        drop_client(epoll, idx, pool, free_list);
+                    }
                 }
             } else {
                 drop_client(epoll, idx, pool, free_list);
@@ -313,8 +323,10 @@ unsafe fn handle_client(c: &mut Client, bits: u32) -> bool {
         let response = route(&c.buf[..total], body_start);
         compact(c, total);
 
-        if !write_all(c, response) {
-            return true;
+        match write_response(c, response) {
+            WriteResult::Done => {}
+            WriteResult::Pending => return true,
+            WriteResult::Closed => return false,
         }
     }
 
@@ -322,10 +334,10 @@ unsafe fn handle_client(c: &mut Client, bits: u32) -> bool {
 }
 
 fn route(req: &[u8], body_start: usize) -> &'static [u8] {
-    if req.len() >= 10 && req.starts_with(b"GET /ready") {
+    if starts_with_path(req, b"GET /ready") {
         return READY;
     }
-    if req.len() >= 17 && req.starts_with(b"POST /fraud-score") {
+    if starts_with_path(req, b"POST /fraud-score") {
         if body_start < req.len() {
             let body = &req[body_start..];
             return handle_fraud_score(body);
@@ -333,6 +345,11 @@ fn route(req: &[u8], body_start: usize) -> &'static [u8] {
         return RESP_0; // fallback: approve if no body
     }
     NOT_FOUND
+}
+
+#[inline(always)]
+fn starts_with_path(req: &[u8], method_path: &[u8]) -> bool {
+    req.starts_with(method_path) && req.get(method_path.len()).copied() == Some(b' ')
 }
 
 // ===========================================================================
@@ -444,23 +461,67 @@ impl Transaction {
 /// Find the byte offset right after `key` (including the colon) in `data`.
 /// Searches for `"key":` pattern and returns position after the colon.
 fn find_key(data: &[u8], key: &[u8], from: usize) -> Option<usize> {
+    find_key_in_range(data, key, from, data.len())
+}
+
+fn find_key_in_range(data: &[u8], key: &[u8], from: usize, to: usize) -> Option<usize> {
     let mut i = from;
-    while i + key.len() + 3 < data.len() {
+    let end = to.min(data.len());
+    while i + key.len() + 3 < end {
         // look for `"key"`
         if data[i] == b'"' && data[i + 1..].starts_with(key) && data[i + 1 + key.len()] == b'"' {
             // skip past `"key"` then find `:`
             let mut p = i + 1 + key.len() + 1; // past closing quote
-            while p < data.len() && data[p] == b' ' {
+            while p < end && data[p] == b' ' {
                 p += 1;
             }
-            if p < data.len() && data[p] == b':' {
+            if p < end && data[p] == b':' {
                 p += 1;
                 // skip whitespace after colon
-                while p < data.len() && (data[p] == b' ' || data[p] == b'\n' || data[p] == b'\r' || data[p] == b'\t') {
+                while p < end && (data[p] == b' ' || data[p] == b'\n' || data[p] == b'\r' || data[p] == b'\t') {
                     p += 1;
                 }
                 return Some(p);
             }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_object_end(data: &[u8], pos: usize) -> Option<usize> {
+    let mut i = pos;
+    while i < data.len() && (data[i] == b' ' || data[i] == b'\n' || data[i] == b'\r' || data[i] == b'\t') {
+        i += 1;
+    }
+    if i >= data.len() || data[i] != b'{' {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    while i < data.len() {
+        match data[i] {
+            b'"' => {
+                i += 1;
+                while i < data.len() {
+                    if data[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if data[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -538,18 +599,19 @@ fn parse_transaction(body: &[u8]) -> Option<Transaction> {
 
     // --- transaction section ---
     let tx_section = find_section(body, b"transaction")?;
+    let tx_end = find_object_end(body, tx_section)?;
 
-    if let Some(p) = find_key(body, b"amount", tx_section) {
+    if let Some(p) = find_key_in_range(body, b"amount", tx_section, tx_end) {
         let (val, _) = parse_json_float(body, p);
         tx.amount = val;
     }
 
-    if let Some(p) = find_key(body, b"installments", tx_section) {
+    if let Some(p) = find_key_in_range(body, b"installments", tx_section, tx_end) {
         let (val, _) = parse_json_float(body, p);
         tx.installments = val;
     }
 
-    if let Some(p) = find_key(body, b"requested_at", tx_section) {
+    if let Some(p) = find_key_in_range(body, b"requested_at", tx_section, tx_end) {
         let (s, _) = parse_json_string(body, p);
         let len = s.len().min(20);
         tx.requested_at[..len].copy_from_slice(&s[..len]);
@@ -558,19 +620,20 @@ fn parse_transaction(body: &[u8]) -> Option<Transaction> {
 
     // --- customer section ---
     let cust_section = find_section(body, b"customer")?;
+    let cust_end = find_object_end(body, cust_section)?;
 
-    if let Some(p) = find_key(body, b"avg_amount", cust_section) {
+    if let Some(p) = find_key_in_range(body, b"avg_amount", cust_section, cust_end) {
         let (val, _) = parse_json_float(body, p);
         tx.avg_amount = if val > 0.0 { val } else { 1.0 };
     }
 
-    if let Some(p) = find_key(body, b"tx_count_24h", cust_section) {
+    if let Some(p) = find_key_in_range(body, b"tx_count_24h", cust_section, cust_end) {
         let (val, _) = parse_json_float(body, p);
         tx.tx_count_24h = val;
     }
 
     // known_merchants array
-    if let Some(p) = find_key(body, b"known_merchants", cust_section) {
+    if let Some(p) = find_key_in_range(body, b"known_merchants", cust_section, cust_end) {
         // p should point to `[`
         if p < body.len() && body[p] == b'[' {
             let mut i = p + 1;
@@ -596,15 +659,16 @@ fn parse_transaction(body: &[u8]) -> Option<Transaction> {
 
     // --- merchant section ---
     let merch_section = find_section(body, b"merchant")?;
+    let merch_end = find_object_end(body, merch_section)?;
 
-    if let Some(p) = find_key(body, b"id", merch_section) {
+    if let Some(p) = find_key_in_range(body, b"id", merch_section, merch_end) {
         let (s, _) = parse_json_string(body, p);
         let slen = s.len().min(16);
         tx.merchant_id[..slen].copy_from_slice(&s[..slen]);
         tx.merchant_id_len = slen;
     }
 
-    if let Some(p) = find_key(body, b"mcc", merch_section) {
+    if let Some(p) = find_key_in_range(body, b"mcc", merch_section, merch_end) {
         let (s, _) = parse_json_string(body, p);
         let slen = s.len().min(8);
         tx.mcc[..slen].copy_from_slice(&s[..slen]);
@@ -612,25 +676,26 @@ fn parse_transaction(body: &[u8]) -> Option<Transaction> {
     }
 
     // merchant avg_amount — must search after merch_section to avoid customer's
-    if let Some(p) = find_key(body, b"avg_amount", merch_section) {
+    if let Some(p) = find_key_in_range(body, b"avg_amount", merch_section, merch_end) {
         let (val, _) = parse_json_float(body, p);
         tx.merchant_avg_amount = val;
     }
 
     // --- terminal section ---
     let term_section = find_section(body, b"terminal")?;
+    let term_end = find_object_end(body, term_section)?;
 
-    if let Some(p) = find_key(body, b"is_online", term_section) {
+    if let Some(p) = find_key_in_range(body, b"is_online", term_section, term_end) {
         let (val, _) = parse_json_bool(body, p);
         tx.is_online = val;
     }
 
-    if let Some(p) = find_key(body, b"card_present", term_section) {
+    if let Some(p) = find_key_in_range(body, b"card_present", term_section, term_end) {
         let (val, _) = parse_json_bool(body, p);
         tx.card_present = val;
     }
 
-    if let Some(p) = find_key(body, b"km_from_home", term_section) {
+    if let Some(p) = find_key_in_range(body, b"km_from_home", term_section, term_end) {
         let (val, _) = parse_json_float(body, p);
         tx.km_from_home = val;
     }
@@ -640,16 +705,17 @@ fn parse_transaction(body: &[u8]) -> Option<Transaction> {
         if is_json_null(body, p) {
             tx.has_last_tx = false;
         } else {
+            let last_end = find_object_end(body, p)?;
             tx.has_last_tx = true;
 
-            if let Some(tp) = find_key(body, b"timestamp", p) {
+            if let Some(tp) = find_key_in_range(body, b"timestamp", p, last_end) {
                 let (s, _) = parse_json_string(body, tp);
                 let len = s.len().min(20);
                 tx.last_timestamp[..len].copy_from_slice(&s[..len]);
                 tx.last_timestamp_len = len;
             }
 
-            if let Some(kp) = find_key(body, b"km_from_current", p) {
+            if let Some(kp) = find_key_in_range(body, b"km_from_current", p, last_end) {
                 let (val, _) = parse_json_float(body, kp);
                 tx.km_from_last = val;
             }
@@ -804,27 +870,36 @@ fn parse_u32(s: &[u8]) -> u32 {
 }
 
 // ===========================================================================
-// Existing infrastructure (write_all, flush, compact, etc.)
+// Existing infrastructure (write_response, flush, compact, etc.)
 // ===========================================================================
-fn write_all(c: &mut Client, resp: &'static [u8]) -> bool {
+enum WriteResult {
+    Done,
+    Pending,
+    Closed,
+}
+
+fn write_response(c: &mut Client, resp: &'static [u8]) -> WriteResult {
     let mut off = 0usize;
     while off < resp.len() {
         let n = write_fd(c.fd, &resp[off..]);
         if n == 0 {
-            return false;
+            return WriteResult::Closed;
         }
         if n < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted {
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == ErrorKind::WouldBlock {
                 c.pending = Some(resp);
                 c.pending_off = off;
-                return false;
+                return WriteResult::Pending;
             }
-            return false;
+            return WriteResult::Closed;
         }
         off += n as usize;
     }
-    true
+    WriteResult::Done
 }
 
 fn flush(c: &mut Client) -> bool {
@@ -839,7 +914,10 @@ fn flush(c: &mut Client) -> bool {
         }
         if n < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted {
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == ErrorKind::WouldBlock {
                 c.pending_off = off;
                 return true;
             }
@@ -938,7 +1016,7 @@ fn read_fd(fd: RawFd, buf: *mut u8, len: usize) -> isize {
 }
 
 fn write_fd(fd: RawFd, buf: &[u8]) -> isize {
-    unsafe { write(fd, buf.as_ptr().cast(), buf.len()) }
+    unsafe { send(fd, buf.as_ptr().cast(), buf.len(), MSG_NOSIGNAL) }
 }
 
 fn epoll_add(epoll: RawFd, fd: RawFd, data: u64, events: u32) -> bool {
@@ -949,11 +1027,9 @@ fn epoll_add(epoll: RawFd, fd: RawFd, data: u64, events: u32) -> bool {
     true
 }
 
-fn epoll_mod(epoll: RawFd, fd: RawFd, data: u64, events: u32) {
+fn epoll_mod(epoll: RawFd, fd: RawFd, data: u64, events: u32) -> bool {
     let mut ev = EpollEvent::new(events, data);
-    if unsafe { epoll_ctl(epoll, EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
-        close_fd(fd);
-    }
+    (unsafe { epoll_ctl(epoll, EPOLL_CTL_MOD, fd, &mut ev) }) >= 0
 }
 
 fn epoll_del(epoll: RawFd, fd: RawFd) {
