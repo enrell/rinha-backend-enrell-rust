@@ -203,6 +203,7 @@ pub struct Index {
     pub count: usize,
     partitions: [PartitionMeta; PARTITIONS],
     nodes: Box<[KdNode]>,
+    max_extra_partitions: usize,
 }
 
 impl Index {
@@ -267,6 +268,7 @@ impl Index {
             count,
             partitions,
             nodes,
+            max_extra_partitions: max_extra_partitions(),
         }
     }
 
@@ -326,6 +328,7 @@ impl Index {
             count,
             partitions,
             nodes,
+            max_extra_partitions: max_extra_partitions(),
         }
     }
 
@@ -368,18 +371,26 @@ impl Index {
         stats_set_key::<WITH_STATS>(stats, key as u8);
         stats_partition_considered::<WITH_STATS>(stats);
         self.search_one_partition::<WITH_STATS>(&self.partitions[key], qptr, staged_query, top5, stats);
+        if self.max_extra_partitions == 0 {
+            return;
+        }
 
         let mut cands = [PartCand { lb: 0, idx: 0 }; PARTITIONS - 1];
         let mut cand_count = 0usize;
         let mut k = 0usize;
+        let initial_worst = top5.worst();
         while k < PARTITIONS {
             if k != key {
                 let p = &self.partitions[k];
                 if p.count != 0 {
                     stats_partition_considered::<WITH_STATS>(stats);
                     let lb = unsafe { lower_bound(qptr, p.bbox_min.as_ptr(), p.bbox_max.as_ptr()) };
-                    cands[cand_count] = PartCand { lb, idx: k as u16 };
-                    cand_count += 1;
+                    if lb < initial_worst {
+                        cands[cand_count] = PartCand { lb, idx: k as u16 };
+                        cand_count += 1;
+                    } else {
+                        stats_partitions_pruned::<WITH_STATS>(stats, 1);
+                    }
                 } else {
                     stats_empty_partition::<WITH_STATS>(stats);
                 }
@@ -390,6 +401,7 @@ impl Index {
         cands[..cand_count].sort_unstable_by_key(|c| c.lb);
 
         let mut i = 0usize;
+        let mut searched_extra = 0usize;
         while i < cand_count {
             let cand = cands[i];
             if cand.lb >= top5.worst() {
@@ -398,6 +410,11 @@ impl Index {
             }
             let p = &self.partitions[cand.idx as usize];
             self.search_one_partition::<WITH_STATS>(p, qptr, staged_query, top5, stats);
+            searched_extra += 1;
+            if searched_extra >= self.max_extra_partitions {
+                stats_partitions_pruned::<WITH_STATS>(stats, (cand_count - i - 1) as u32);
+                break;
+            }
             i += 1;
         }
     }
@@ -909,6 +926,16 @@ fn env_true(name: &str) -> bool {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
         Err(_) => false,
     }
+}
+
+fn max_extra_partitions() -> usize {
+    if env_true("INDEX_PRIMARY_ONLY") {
+        return 0;
+    }
+    std::env::var("INDEX_MAX_EXTRA_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
 }
 
 fn warmup_pages(ptr: *const u8, len: usize) {

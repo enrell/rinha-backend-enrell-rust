@@ -46,6 +46,8 @@ services:
       INDEX_PATH: /index/index.bin
       INDEX_HUGE: ${INDEX_HUGE:-1}
       INDEX_MLOCK: ${INDEX_MLOCK:-1}
+      INDEX_PRIMARY_ONLY: ${INDEX_PRIMARY_ONLY:-0}
+      INDEX_MAX_EXTRA_PARTITIONS: ${INDEX_MAX_EXTRA_PARTITIONS:-16}
       INDEX_STATS: ${INDEX_STATS:-false}
     ulimits:
       nofile:
@@ -76,6 +78,8 @@ services:
       INDEX_PATH: /index/index.bin
       INDEX_HUGE: ${INDEX_HUGE:-1}
       INDEX_MLOCK: ${INDEX_MLOCK:-1}
+      INDEX_PRIMARY_ONLY: ${INDEX_PRIMARY_ONLY:-0}
+      INDEX_MAX_EXTRA_PARTITIONS: ${INDEX_MAX_EXTRA_PARTITIONS:-16}
       INDEX_STATS: ${INDEX_STATS:-false}
     ulimits:
       nofile:
