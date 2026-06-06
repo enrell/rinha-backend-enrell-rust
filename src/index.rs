@@ -6,6 +6,7 @@ pub const DIM: usize = 14;
 pub const STORE_DIM: usize = 16;
 pub const SCALE: f64 = 10_000.0;
 pub const PARTITIONS: usize = 256;
+pub const MAX_SAFE_DIST: i64 = i32::MAX as i64;
 
 pub const PARTITIONS_MAGIC: &[u8; 8] = b"RINHIDX5";
 pub const INDEX_VERSION: u32 = 5;
@@ -28,6 +29,37 @@ pub const COLD_SIMD_DIMS: [usize; 8] = [
     PAD_DIMS[0],
     PAD_DIMS[1],
 ];
+
+pub const QUANTIZED_MAX_ABS_DIFF_BY_DIM: [i64; DIM] = [
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    (SCALE as i64) * 2,
+    (SCALE as i64) * 2,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+    SCALE as i64,
+];
+pub const MAX_QUANTIZED_DIST_SQ: i64 = max_quantized_dist_sq();
+
+const _: () = assert!(MAX_QUANTIZED_DIST_SQ <= MAX_SAFE_DIST);
+
+const fn max_quantized_dist_sq() -> i64 {
+    let mut sum = 0i64;
+    let mut i = 0usize;
+    while i < DIM {
+        let d = QUANTIZED_MAX_ABS_DIFF_BY_DIM[i];
+        sum += d * d;
+        i += 1;
+    }
+    sum
+}
 
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
@@ -100,6 +132,34 @@ pub fn quantize_vec(vals: &[f64; DIM]) -> QVec {
         i += 1;
     }
     QVec(qv)
+}
+
+#[allow(dead_code)]
+pub fn assert_vector_domain(vals: &[f64; DIM]) {
+    let mut i = 0usize;
+    while i < DIM {
+        let v = vals[i];
+        let ok = if i == 5 || i == 6 {
+            (-1.0..=1.0).contains(&v)
+        } else {
+            (0.0..=1.0).contains(&v)
+        };
+        assert!(
+            ok,
+            "vector dimension {} out of safe distance domain: {}",
+            i, v
+        );
+        i += 1;
+    }
+}
+
+#[allow(dead_code)]
+pub fn assert_dist_safe() {
+    assert!(
+        MAX_QUANTIZED_DIST_SQ <= MAX_SAFE_DIST,
+        "distance can overflow i32: worst={}",
+        MAX_QUANTIZED_DIST_SQ
+    );
 }
 
 pub const fn align_up(v: usize, align: usize) -> usize {

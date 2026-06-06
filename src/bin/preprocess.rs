@@ -338,6 +338,7 @@ fn parse_entry<R: Read>(parser: &mut StreamParser<R>) -> (QVec, bool) {
 
     assert!(got_vector, "missing 'vector' field");
     assert!(got_label, "missing 'label' field");
+    assert_vector_domain(&vector);
 
     (quantize_vec(&vector), is_fraud)
 }
@@ -345,6 +346,8 @@ fn parse_entry<R: Read>(parser: &mut StreamParser<R>) -> (QVec, bool) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    assert_dist_safe();
+
     let args: Vec<String> = std::env::args().collect();
     let input_path = args
         .get(1)
