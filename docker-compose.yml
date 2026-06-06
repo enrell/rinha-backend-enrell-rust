@@ -1,7 +1,6 @@
 services:
   lb:
-    build: .
-    image: rinha-backend-enrell-rust:local
+    image: docker.io/enrellsa/rinha-backend-enrell-rust:latest
     command: /app/lb
     platform: linux/amd64
     cpuset: ${LB_CPUSET:-0,1,2,3}
@@ -14,7 +13,6 @@ services:
     environment:
       LISTEN_ADDR: 0.0.0.0:9999
       BACKEND_SOCKS: /sockets/api1.sock,/sockets/api2.sock
-
     depends_on:
       api1:
         condition: service_started
@@ -31,8 +29,7 @@ services:
           memory: "20MB"
 
   api1:
-    build: .
-    image: rinha-backend-enrell-rust:local
+    image: docker.io/enrellsa/rinha-backend-enrell-rust:latest
     command: /app/api
     platform: linux/amd64
     cpuset: ${API1_CPUSET:-0,1,2,3}
@@ -63,8 +60,7 @@ services:
           memory: "165MB"
 
   api2:
-    build: .
-    image: rinha-backend-enrell-rust:local
+    image: docker.io/enrellsa/rinha-backend-enrell-rust:latest
     command: /app/api
     platform: linux/amd64
     cpuset: ${API2_CPUSET:-0,1,2,3}

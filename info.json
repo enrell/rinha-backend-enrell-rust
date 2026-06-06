@@ -1,0 +1,7 @@
+{
+  "participants": ["enrell"],
+  "social": ["https://github.com/enrell"],
+  "source-code-repo": "https://github.com/enrell/rinha-backend-enrell-rust",
+  "stack": ["rust", "epoll", "raw-syscalls", "docker"],
+  "open_to_work": false
+}
