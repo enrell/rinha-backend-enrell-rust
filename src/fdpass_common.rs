@@ -7,6 +7,9 @@ pub const FD_BYTES: usize = mem::size_of::<c_int>();
 pub const CMSGHDR_BYTES: usize = mem::size_of::<Cmsghdr>();
 pub const CONTROL_BYTES: usize = cmsg_space(FD_BYTES);
 
+#[repr(C, align(8))]
+pub struct ControlBuffer(pub [u8; CONTROL_BYTES]);
+
 #[repr(C)]
 pub struct Iovec {
     pub iov_base: *mut c_void,

@@ -18,10 +18,10 @@ pub fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
         iov_base: byte.as_mut_ptr().cast(),
         iov_len: byte.len(),
     };
-    let mut control = [0u8; CONTROL_BYTES];
+    let mut control = ControlBuffer([0u8; CONTROL_BYTES]);
 
     unsafe {
-        let cmsg = control.as_mut_ptr().cast::<Cmsghdr>();
+        let cmsg = control.0.as_mut_ptr().cast::<Cmsghdr>();
         (*cmsg).cmsg_len = cmsg_len(FD_BYTES);
         (*cmsg).cmsg_level = SOL_SOCKET;
         (*cmsg).cmsg_type = SCM_RIGHTS;
@@ -33,15 +33,20 @@ pub fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
         msg_namelen: 0,
         msg_iov: &mut iov,
         msg_iovlen: 1,
-        msg_control: control.as_mut_ptr().cast(),
-        msg_controllen: control.len(),
+        msg_control: control.0.as_mut_ptr().cast(),
+        msg_controllen: control.0.len(),
         msg_flags: 0,
     };
 
-    let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if sent < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+    loop {
+        let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, 0) };
+        if sent >= 0 {
+            return Ok(());
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }

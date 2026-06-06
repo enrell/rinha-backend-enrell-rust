@@ -5,8 +5,9 @@
 // KD/BBox trees per partition, and writes:
 //   - vectors.bin      (count x STORE_DIM x 2 bytes, contiguous little-endian i16)
 //   - labels.bin       (count bytes, 0=legit 1=fraud)
-//   - partitions.bin   (Index v3 metadata)
+//   - partitions.bin   (Index metadata)
 //   - nodes.bin        (KD/BBox nodes)
+//   - index.bin        (one-file runtime index with hot4/mid4/cold8 stages)
 //
 // Usage:
 //   preprocess [input_json] [output_dir]
@@ -424,11 +425,12 @@ fn main() {
         let root = build_kd(&mut records[start..end], start, &mut nodes) as i32;
         let (bbox_min, bbox_max) = bbox_records(&records[start..end]);
         partitions[key] = PartitionMeta {
+            bbox_min,
+            bbox_max,
             start: start as u32,
             count: (end - start) as u32,
             root,
-            bbox_min,
-            bbox_max,
+            _pad: 0,
         };
         partition_node_counts[key] = (nodes.len() - node_start) as u32;
         start = end;
@@ -511,14 +513,19 @@ fn write_index_file<W: Write>(
 ) {
     let partitions_len = partition_bytes_len();
     let nodes_len = nodes.len() * node_bytes_len();
-    let vectors_len = records.len() * STORE_DIM * std::mem::size_of::<i16>();
+    let hot4_len = records.len() * HOT_DIMS.len() * std::mem::size_of::<i16>();
+    let mid4_len = records.len() * MID_DIMS.len() * std::mem::size_of::<i16>();
+    let cold8_len = records.len() * COLD_SIMD_DIMS.len() * std::mem::size_of::<i16>();
     let labels_len = records.len();
 
-    let partitions_off = INDEX_FILE_HEADER_LEN as u64;
-    let nodes_off = partitions_off + partitions_len as u64;
-    let vectors_off = nodes_off + nodes_len as u64;
-    let labels_off = vectors_off + vectors_len as u64;
-    let total_len = labels_off + labels_len as u64;
+    let partitions_off = INDEX_FILE_HEADER_LEN;
+    let nodes_off = align_up(partitions_off + partitions_len, CACHELINE);
+    let hot4_off = align_up(nodes_off + nodes_len, CACHELINE);
+    let mid4_off = align_up(hot4_off + hot4_len, CACHELINE);
+    let cold8_off = align_up(mid4_off + mid4_len, CACHELINE);
+    let vectors_off = 0u64;
+    let labels_off = align_up(cold8_off + cold8_len, CACHELINE);
+    let total_len = labels_off + labels_len;
 
     w.write_all(INDEX_FILE_MAGIC).expect("write index magic");
     write_u32(w, INDEX_VERSION);
@@ -527,12 +534,17 @@ fn write_index_file<W: Write>(
     write_u32(w, SCALE as u32);
     write_u64(w, records.len() as u64);
     write_u64(w, nodes.len() as u64);
-    write_u64(w, partitions_off);
-    write_u64(w, nodes_off);
+    write_u64(w, partitions_off as u64);
+    write_u64(w, nodes_off as u64);
+    write_u64(w, hot4_off as u64);
+    write_u64(w, mid4_off as u64);
+    write_u64(w, cold8_off as u64);
     write_u64(w, vectors_off);
-    write_u64(w, labels_off);
-    write_u64(w, total_len);
+    write_u64(w, labels_off as u64);
+    write_u64(w, total_len as u64);
 
+    let mut written = RAW_INDEX_FILE_HEADER_LEN;
+    write_padding_to(w, &mut written, partitions_off);
     write_partitions(
         w,
         records.len() as u64,
@@ -540,14 +552,39 @@ fn write_index_file<W: Write>(
         partitions,
         partition_node_counts,
     );
+    written += partitions_len;
+    write_padding_to(w, &mut written, nodes_off);
     for node in nodes {
         write_node(w, node);
     }
+    written += nodes_len;
+    write_padding_to(w, &mut written, hot4_off);
     for r in records {
-        write_qvec(w, &r.qvec);
+        write_stage(w, &r.qvec, &HOT_DIMS);
     }
+    written += hot4_len;
+    write_padding_to(w, &mut written, mid4_off);
+    for r in records {
+        write_stage(w, &r.qvec, &MID_DIMS);
+    }
+    written += mid4_len;
+    write_padding_to(w, &mut written, cold8_off);
+    for r in records {
+        write_stage(w, &r.qvec, &COLD_SIMD_DIMS);
+    }
+    written += cold8_len;
+    write_padding_to(w, &mut written, labels_off);
     for r in records {
         w.write_all(&[r.label]).expect("write index label");
+    }
+}
+
+fn write_padding_to<W: Write>(w: &mut W, written: &mut usize, target: usize) {
+    const ZEROES: [u8; CACHELINE] = [0; CACHELINE];
+    while *written < target {
+        let n = (target - *written).min(ZEROES.len());
+        w.write_all(&ZEROES[..n]).expect("write index padding");
+        *written += n;
     }
 }
 
@@ -591,7 +628,7 @@ fn build_kd(records: &mut [Record], global_start: usize, nodes: &mut Vec<KdNode>
 
 fn bbox_records(records: &[Record]) -> (QVec, QVec) {
     if records.is_empty() {
-        return ([0; STORE_DIM], [0; STORE_DIM]);
+        return (QVec([0; STORE_DIM]), QVec([0; STORE_DIM]));
     }
     let mut min = [i16::MAX; STORE_DIM];
     let mut max = [i16::MIN; STORE_DIM];
@@ -608,7 +645,7 @@ fn bbox_records(records: &[Record]) -> (QVec, QVec) {
             d += 1;
         }
     }
-    (min, max)
+    (QVec(min), QVec(max))
 }
 
 fn widest_dim(bbox_min: &QVec, bbox_max: &QVec) -> usize {
@@ -686,8 +723,14 @@ fn write_node<W: Write>(w: &mut W, node: &KdNode) {
 }
 
 fn write_qvec<W: Write>(w: &mut W, qvec: &QVec) {
-    for v in qvec {
+    for v in qvec.iter() {
         w.write_all(&v.to_le_bytes()).expect("write qvec");
+    }
+}
+
+fn write_stage<W: Write>(w: &mut W, qvec: &QVec, dims: &[usize]) {
+    for &dim in dims {
+        w.write_all(&qvec[dim].to_le_bytes()).expect("write stage");
     }
 }
 

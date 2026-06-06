@@ -29,26 +29,27 @@ O índice é pré-processado no build da imagem Docker:
 3. Cada vetor vira `QVec = [i16; 16]` com `SCALE = 10000`.
 4. Os vetores são ordenados por `partition_key` de 8 bits.
 5. Cada partição recebe uma KD/BBox tree exata.
-6. O índice serializado é copiado para `/app/data`.
+6. O `index.bin` runtime é gravado em layout staged: `hot4`, `mid4`, `cold8`, labels e metadados.
+7. O índice serializado é copiado para `/index/index.bin`.
 
 Arquivos gerados:
 
 | Arquivo | Conteúdo |
 | --- | --- |
-| `index.bin` | Índice único usado em runtime via `INDEX_PATH` |
+| `index.bin` | Índice único usado em runtime via `INDEX_PATH`, com layout `hot4/mid4/cold8` |
 | `vectors.bin` | Vetores quantizados contíguos |
 | `labels.bin` | Labels `0=legit`, `1=fraud` |
 | `partitions.bin` | Metadados das 256 partições |
 | `nodes.bin` | Nós KD/BBox serializados |
 
-A busca em runtime é exata: usa lower bound de bounding box para podar partições/nós, mas não descarta candidatos sem prova por distância.
+A busca em runtime é exata: usa lower bound de bounding box para podar partições/nós e lower bound por soma parcial (`hot4`, depois `hot4+mid4`) para descartar candidatos individuais sem tocar o restante do vetor quando isso já não pode entrar no top-5.
 
 ## Arquitetura do Código
 
 | Arquivo | Responsabilidade |
 | --- | --- |
 | `src/index.rs` | Formato compartilhado do índice, quantização e partition key |
-| `src/search.rs` | Carregamento via mmap e busca exata KD/BBox AVX2 |
+| `src/search.rs` | Carregamento via mmap e busca exata KD/BBox com staged lower-bound |
 | `src/fdpass_common.rs` | Tipos comuns de `sendmsg`/`recvmsg` |
 | `src/fdpass_send.rs` | Envio de fd usado pelo `lb` |
 | `src/fdpass_recv.rs` | Recepção de fd usada pela `api` |
@@ -85,7 +86,7 @@ docker compose up -d --build
 O `Dockerfile` faz build em múltiplos estágios:
 
 1. `builder`: compila `lb`, `api` e `preprocess`.
-2. `indexer`: descompacta `references.json.gz` e gera `/app/data`.
+2. `indexer`: descompacta `references.json.gz` e gera `/app/index`.
 3. runtime `alpine`: contém apenas binários e `/index/index.bin`.
 
 ## Limites de Recursos

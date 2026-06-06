@@ -14,7 +14,7 @@ use std::ffi::{c_int, c_void};
 use std::fs;
 use std::io::ErrorKind;
 use std::mem;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::ptr;
@@ -240,19 +240,20 @@ fn recv_fds(epoll: RawFd, control: &UnixStream, bits: u32, pool: &mut [Client], 
     loop {
         match fdpass_recv::recv_fd(control) {
             Ok(Some(fd)) => {
-                tune_client(fd);
+                let raw_fd = fd.as_raw_fd();
+                tune_client(raw_fd);
                 let Some(idx) = free_list.pop() else {
-                    close_fd(fd);
                     return;
                 };
+                let raw_fd = fd.into_raw_fd();
                 let slot = &mut pool[idx as usize];
-                slot.fd = fd;
+                slot.fd = raw_fd;
                 slot.len = 0;
                 slot.pending = None;
                 slot.pending_off = 0;
                 slot.last_events = EPOLLIN | EPOLLRDHUP;
-                if !epoll_add(epoll, fd, idx as u64, EPOLLIN | EPOLLRDHUP) {
-                    close_fd(fd);
+                if !epoll_add(epoll, raw_fd, idx as u64, EPOLLIN | EPOLLRDHUP) {
+                    close_fd(raw_fd);
                     slot.fd = -1;
                     free_list.push(idx);
                 }
@@ -351,7 +352,7 @@ fn handle_fraud_score(body: &[u8]) -> &'static [u8] {
         let fraud_count = get_index().search_exact_with_stats(&qvec, &mut stats);
         let search_ns = start.elapsed().as_nanos();
         eprintln!(
-            "search_stats key={} fraud_count={} search_ns={} partitions_considered={} partitions_searched={} partitions_pruned={} empty_partitions={} nodes_visited={} nodes_pruned={} leaves_scanned={} vectors_scanned={}",
+            "search_stats key={} fraud_count={} search_ns={} partitions_considered={} partitions_searched={} partitions_pruned={} empty_partitions={} nodes_visited={} nodes_pruned={} leaves_scanned={} vectors_scanned={} stage8_pruned={} full_scanned={}",
             stats.partition_key,
             fraud_count,
             search_ns,
@@ -363,6 +364,8 @@ fn handle_fraud_score(body: &[u8]) -> &'static [u8] {
             stats.nodes_pruned,
             stats.leaves_scanned,
             stats.vectors_scanned,
+            stats.stage8_pruned,
+            stats.full_scanned,
         );
         fraud_count
     } else {

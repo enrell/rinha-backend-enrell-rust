@@ -81,6 +81,39 @@ struct Top5 {
     fraud: [bool; K],
 }
 
+struct StagedQuery {
+    hotmid8: [i16; 8],
+    cold8: [i16; 8],
+}
+
+impl StagedQuery {
+    #[inline(always)]
+    fn new(query: &QVec) -> Self {
+        Self {
+            hotmid8: [
+                query[HOT_DIMS[0]],
+                query[HOT_DIMS[1]],
+                query[HOT_DIMS[2]],
+                query[HOT_DIMS[3]],
+                query[MID_DIMS[0]],
+                query[MID_DIMS[1]],
+                query[MID_DIMS[2]],
+                query[MID_DIMS[3]],
+            ],
+            cold8: [
+                query[COLD_SIMD_DIMS[0]],
+                query[COLD_SIMD_DIMS[1]],
+                query[COLD_SIMD_DIMS[2]],
+                query[COLD_SIMD_DIMS[3]],
+                query[COLD_SIMD_DIMS[4]],
+                query[COLD_SIMD_DIMS[5]],
+                query[COLD_SIMD_DIMS[6]],
+                query[COLD_SIMD_DIMS[7]],
+            ],
+        }
+    }
+}
+
 impl Top5 {
     fn new() -> Self {
         Self {
@@ -133,10 +166,15 @@ pub struct SearchStats {
     pub nodes_pruned: u32,
     pub leaves_scanned: u32,
     pub vectors_scanned: u32,
+    pub stage8_pruned: u32,
+    pub full_scanned: u32,
 }
 
 pub struct Index {
     pub vectors: *const i16,
+    hot4: *const i16,
+    mid4: *const i16,
+    cold8: *const i16,
     pub labels: *const u8,
     pub count: usize,
     partitions: [PartitionMeta; PARTITIONS],
@@ -184,17 +222,21 @@ impl Index {
             let mut p = [PartitionMeta::empty(); PARTITIONS];
             let bbox = bbox_from_ptr(vptr_u8, count);
             p[0] = PartitionMeta {
+                bbox_min: bbox.0,
+                bbox_max: bbox.1,
                 start: 0,
                 count: count as u32,
                 root: -1,
-                bbox_min: bbox.0,
-                bbox_max: bbox.1,
+                _pad: 0,
             };
             (p, Vec::new().into_boxed_slice())
         };
 
         Self {
             vectors: vptr_u8 as *const i16,
+            hot4: std::ptr::null(),
+            mid4: std::ptr::null(),
+            cold8: std::ptr::null(),
             labels: lptr,
             count,
             partitions,
@@ -217,16 +259,30 @@ impl Index {
         let nodes_count = read_u64(data, &mut pos) as usize;
         let partitions_off = read_u64(data, &mut pos) as usize;
         let nodes_off = read_u64(data, &mut pos) as usize;
+        let hot4_off = read_u64(data, &mut pos) as usize;
+        let mid4_off = read_u64(data, &mut pos) as usize;
+        let cold8_off = read_u64(data, &mut pos) as usize;
         let vectors_off = read_u64(data, &mut pos) as usize;
         let labels_off = read_u64(data, &mut pos) as usize;
         let total_len = read_u64(data, &mut pos) as usize;
         assert_eq!(total_len, len, "index.bin length mismatch");
+        assert_eq!(partitions_off % CACHELINE, 0, "index partitions offset is unaligned");
+        assert_eq!(nodes_off % CACHELINE, 0, "index nodes offset is unaligned");
+        assert_eq!(hot4_off % CACHELINE, 0, "index hot4 offset is unaligned");
+        assert_eq!(mid4_off % CACHELINE, 0, "index mid4 offset is unaligned");
+        assert_eq!(cold8_off % CACHELINE, 0, "index cold8 offset is unaligned");
 
         let partitions_len = partition_bytes_len();
         let nodes_len = nodes_count * node_bytes_len();
+        let hot4_len = count * HOT_DIMS.len() * 2;
+        let mid4_len = count * MID_DIMS.len() * 2;
+        let cold8_len = count * COLD_SIMD_DIMS.len() * 2;
         assert!(partitions_off + partitions_len <= len, "index partitions out of bounds");
         assert!(nodes_off + nodes_len <= len, "index nodes out of bounds");
-        assert!(vectors_off + count * STORE_DIM * 2 <= len, "index vectors out of bounds");
+        assert!(hot4_off + hot4_len <= len, "index hot4 out of bounds");
+        assert!(mid4_off + mid4_len <= len, "index mid4 out of bounds");
+        assert!(cold8_off + cold8_len <= len, "index cold8 out of bounds");
+        assert_eq!(vectors_off, 0, "unexpected AoS vectors section");
         assert!(labels_off + count <= len, "index labels out of bounds");
 
         let (partitions, nodes) = parse_partition_files(
@@ -236,7 +292,10 @@ impl Index {
         );
 
         Self {
-            vectors: unsafe { base.add(vectors_off) as *const i16 },
+            vectors: std::ptr::null(),
+            hot4: unsafe { base.add(hot4_off) as *const i16 },
+            mid4: unsafe { base.add(mid4_off) as *const i16 },
+            cold8: unsafe { base.add(cold8_off) as *const i16 },
             labels: unsafe { base.add(labels_off) },
             count,
             partitions,
@@ -256,21 +315,29 @@ impl Index {
     fn search_exact_inner(&self, query: &QVec, stats: *mut SearchStats) -> u32 {
         let mut top5 = Top5::new();
         let qptr = query.as_ptr();
+        let staged_query = StagedQuery::new(query);
 
         if !self.nodes.is_empty() {
-            self.search_partitioned(query, qptr, &mut top5, stats);
+            self.search_partitioned(query, qptr, &staged_query, &mut top5, stats);
             return top5.fraud_count();
         }
 
-        self.scan_range(0, self.count, qptr, &mut top5, stats);
+        self.scan_range(0, self.count, qptr, &staged_query, &mut top5, stats);
         top5.fraud_count()
     }
 
-    fn search_partitioned(&self, query: &QVec, qptr: *const i16, top5: &mut Top5, stats: *mut SearchStats) {
+    fn search_partitioned(
+        &self,
+        query: &QVec,
+        qptr: *const i16,
+        staged_query: &StagedQuery,
+        top5: &mut Top5,
+        stats: *mut SearchStats,
+    ) {
         let key = partition_key(query) as usize;
         stats_set_key(stats, key as u8);
         stats_partition_considered(stats);
-        self.search_one_partition(&self.partitions[key], qptr, top5, stats);
+        self.search_one_partition(&self.partitions[key], qptr, staged_query, top5, stats);
 
         let mut k = 0;
         while k < PARTITIONS {
@@ -280,7 +347,7 @@ impl Index {
                     stats_partition_considered(stats);
                     let lb = unsafe { lower_bound(qptr, p.bbox_min.as_ptr(), p.bbox_max.as_ptr()) };
                     if lb < top5.worst() {
-                        self.search_one_partition(p, qptr, top5, stats);
+                        self.search_one_partition(p, qptr, staged_query, top5, stats);
                     } else {
                         stats_partition_pruned(stats);
                     }
@@ -292,13 +359,20 @@ impl Index {
         }
     }
 
-    fn search_one_partition(&self, part: &PartitionMeta, qptr: *const i16, top5: &mut Top5, stats: *mut SearchStats) {
+    fn search_one_partition(
+        &self,
+        part: &PartitionMeta,
+        qptr: *const i16,
+        staged_query: &StagedQuery,
+        top5: &mut Top5,
+        stats: *mut SearchStats,
+    ) {
         if part.count == 0 {
             return;
         }
         stats_partition_searched(stats);
         if part.root < 0 {
-            self.scan_range(part.start as usize, part.count as usize, qptr, top5, stats);
+            self.scan_range(part.start as usize, part.count as usize, qptr, staged_query, top5, stats);
             return;
         }
 
@@ -317,7 +391,7 @@ impl Index {
             }
             if node.left < 0 {
                 stats_leaf_scanned(stats);
-                self.scan_range(node.start as usize, node.count as usize, qptr, top5, stats);
+                self.scan_range(node.start as usize, node.count as usize, qptr, staged_query, top5, stats);
                 continue;
             }
 
@@ -343,8 +417,21 @@ impl Index {
     }
 
     #[inline(always)]
-    fn scan_range(&self, start: usize, count: usize, qptr: *const i16, top5: &mut Top5, stats: *mut SearchStats) {
+    fn scan_range(
+        &self,
+        start: usize,
+        count: usize,
+        qptr: *const i16,
+        staged_query: &StagedQuery,
+        top5: &mut Top5,
+        stats: *mut SearchStats,
+    ) {
         stats_vectors_scanned(stats, count as u32);
+        if !self.hot4.is_null() {
+            self.scan_range_staged(start, count, staged_query, top5, stats);
+            return;
+        }
+
         let end = start + count;
         let mut i = start;
         while i < end {
@@ -357,6 +444,105 @@ impl Index {
             i += 1;
         }
     }
+
+    #[inline(always)]
+    fn scan_range_staged(&self, start: usize, count: usize, query: &StagedQuery, top5: &mut Top5, stats: *mut SearchStats) {
+        let end = start + count;
+        let mut i = start;
+        while i < end {
+            let d = unsafe {
+                dist_sq_staged(
+                    query,
+                    self.hot4.add(i * HOT_DIMS.len()),
+                    self.mid4.add(i * MID_DIMS.len()),
+                    self.cold8.add(i * COLD_SIMD_DIMS.len()),
+                    top5.worst(),
+                )
+            };
+            if d == i32::MAX {
+                stats_stage8_pruned(stats);
+                i += 1;
+                continue;
+            }
+            stats_full_scanned(stats);
+            if d < top5.worst() {
+                let is_fraud = unsafe { *self.labels.add(i) } != 0;
+                top5.try_insert(d, is_fraud);
+            }
+            i += 1;
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn dist_sq_staged(query: &StagedQuery, hot4: *const i16, mid4: *const i16, cold8: *const i16, tau: i32) -> i32 {
+    unsafe { dist_sq_staged_impl(query, hot4, mid4, cold8, tau) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn dist_sq_staged_impl(query: &StagedQuery, hot4: *const i16, mid4: *const i16, cold8: *const i16, tau: i32) -> i32 {
+    unsafe {
+        let hot = _mm_loadl_epi64(hot4 as *const __m128i);
+        let mid = _mm_loadl_epi64(mid4 as *const __m128i);
+        let v8 = _mm_unpacklo_epi64(hot, mid);
+        let q8 = _mm_loadu_si128(query.hotmid8.as_ptr() as *const __m128i);
+        let d8 = _mm_sub_epi16(q8, v8);
+        let sq8 = _mm_madd_epi16(d8, d8);
+        let mut sum = horizontal_i32x4(sq8);
+        if sum >= tau {
+            return i32::MAX;
+        }
+
+        let vcold = _mm_loadu_si128(cold8 as *const __m128i);
+        let qcold = _mm_loadu_si128(query.cold8.as_ptr() as *const __m128i);
+        let dcold = _mm_sub_epi16(qcold, vcold);
+        let sqcold = _mm_madd_epi16(dcold, dcold);
+        sum += horizontal_i32x4(sqcold);
+        sum
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn horizontal_i32x4(v: __m128i) -> i32 {
+    unsafe {
+        let sum2 = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+        let sum1 = _mm_add_epi32(sum2, _mm_srli_si128(sum2, 4));
+        _mm_cvtsi128_si32(sum1)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn dist_sq_staged_impl(query: &StagedQuery, hot4: *const i16, mid4: *const i16, cold8: *const i16, tau: i32) -> i32 {
+    let mut sum = 0i32;
+
+    unsafe {
+        let mut i = 0usize;
+        while i < 4 {
+            let d = query.hotmid8[i] as i32 - *hot4.add(i) as i32;
+            sum += d * d;
+            i += 1;
+        }
+        i = 0;
+        while i < 4 {
+            let d = query.hotmid8[i + 4] as i32 - *mid4.add(i) as i32;
+            sum += d * d;
+            i += 1;
+        }
+        if sum >= tau {
+            return i32::MAX;
+        }
+
+        i = 0;
+        while i < 8 {
+            let d = query.cold8[i] as i32 - *cold8.add(i) as i32;
+            sum += d * d;
+            i += 1;
+        }
+    }
+
+    sum
 }
 
 #[inline(always)]
@@ -419,6 +605,20 @@ fn stats_leaf_scanned(stats: *mut SearchStats) {
 fn stats_vectors_scanned(stats: *mut SearchStats, count: u32) {
     if !stats.is_null() {
         unsafe { (*stats).vectors_scanned += count };
+    }
+}
+
+#[inline(always)]
+fn stats_stage8_pruned(stats: *mut SearchStats) {
+    if !stats.is_null() {
+        unsafe { (*stats).stage8_pruned += 1 };
+    }
+}
+
+#[inline(always)]
+fn stats_full_scanned(stats: *mut SearchStats) {
+    if !stats.is_null() {
+        unsafe { (*stats).full_scanned += 1 };
     }
 }
 
@@ -576,11 +776,12 @@ fn parse_partition_files(pdata: &[u8], ndata: &[u8], count: usize) -> ([Partitio
         let bbox_min = read_qvec(pdata, &mut pos);
         let bbox_max = read_qvec(pdata, &mut pos);
         partitions[i] = PartitionMeta {
+            bbox_min,
+            bbox_max,
             start,
             count: part_count,
             root,
-            bbox_min,
-            bbox_max,
+            _pad: 0,
         };
         total += part_count as usize;
         i += 1;
@@ -614,7 +815,7 @@ const fn node_bytes_len() -> usize {
 
 fn bbox_from_ptr(vdata: *const u8, count: usize) -> (QVec, QVec) {
     if count == 0 {
-        return ([0; STORE_DIM], [0; STORE_DIM]);
+        return (QVec([0; STORE_DIM]), QVec([0; STORE_DIM]));
     }
     let mut min = [i16::MAX; STORE_DIM];
     let mut max = [i16::MIN; STORE_DIM];
@@ -635,7 +836,7 @@ fn bbox_from_ptr(vdata: *const u8, count: usize) -> (QVec, QVec) {
         }
         i += 1;
     }
-    (min, max)
+    (QVec(min), QVec(max))
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> u32 {
@@ -662,7 +863,7 @@ fn read_qvec(data: &[u8], pos: &mut usize) -> QVec {
         *pos += 2;
         i += 1;
     }
-    v
+    QVec(v)
 }
 
 unsafe impl Send for Index {}
