@@ -1,0 +1,24 @@
+# Cliente de carga com limites parecidos com ambiente enxuto.
+# A API sob teste continua no docker-compose.yml da raiz (1 CPU / 350 MB).
+services:
+  k6:
+    image: grafana/k6:latest
+    network_mode: host
+    environment:
+      K6_NO_USAGE_REPORT: "true"
+      BENCH_URL: ${BENCH_URL:-http://127.0.0.1:9999}
+      BENCH_DURATION: ${BENCH_DURATION:-15s}
+      BENCH_RATE: ${BENCH_RATE:-900}
+      BENCH_MINI_LIMIT: ${BENCH_MINI_LIMIT:-800}
+      BENCH_TEST_DATA: ${BENCH_TEST_DATA:-/testdata/test-data.json}
+    volumes:
+      - ./:/bench:ro
+      - ${BENCH_TEST_DATA_HOST:-/home/enrell/lab/rinha-de-backend-2026/test}:/testdata:ro
+    working_dir: /bench
+    entrypoint: ["k6"]
+    command: ["run", "/bench/quick.js"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "512MB"
