@@ -7,6 +7,8 @@ pub const PARTITIONS: usize = 256;
 
 pub const PARTITIONS_MAGIC: &[u8; 8] = b"RINHIDX3";
 pub const INDEX_VERSION: u32 = 3;
+pub const INDEX_FILE_MAGIC: &[u8; 8] = b"RINHIF01";
+pub const INDEX_FILE_HEADER_LEN: usize = 80;
 
 pub type QVec = [i16; STORE_DIM];
 

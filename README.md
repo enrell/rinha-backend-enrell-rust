@@ -35,6 +35,7 @@ Arquivos gerados:
 
 | Arquivo | Conteúdo |
 | --- | --- |
+| `index.bin` | Índice único usado em runtime via `INDEX_PATH` |
 | `vectors.bin` | Vetores quantizados contíguos |
 | `labels.bin` | Labels `0=legit`, `1=fraud` |
 | `partitions.bin` | Metadados das 256 partições |
@@ -85,7 +86,7 @@ O `Dockerfile` faz build em múltiplos estágios:
 
 1. `builder`: compila `lb`, `api` e `preprocess`.
 2. `indexer`: descompacta `references.json.gz` e gera `/app/data`.
-3. runtime `alpine`: contém apenas binários e índice final.
+3. runtime `alpine`: contém apenas binários e `/index/index.bin`.
 
 ## Limites de Recursos
 
@@ -98,6 +99,16 @@ O `docker-compose.yml` soma exatamente `1 CPU` e `350 MB`:
 | `api2` | `0.40` | `165MB` |
 
 A rede usa `bridge`, e as imagens são configuradas para `linux/amd64`.
+
+O compose deixa afinidade ampla por padrão para evitar regressões de scheduler local, mas permite fixar via env:
+
+| Serviço | `cpuset` |
+| --- | --- |
+| `lb` | `${LB_CPUSET:-0,1,2,3}` |
+| `api1` | `${API1_CPUSET:-0,1,2,3}` |
+| `api2` | `${API2_CPUSET:-0,1,2,3}` |
+
+As APIs usam `INDEX_PATH=/index/index.bin`, `INDEX_HUGE=1`, `INDEX_MLOCK=1` e `ulimits.memlock=-1`.
 
 ## Benchmarks
 

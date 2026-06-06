@@ -441,6 +441,7 @@ fn main() {
     let lpath = Path::new(output_dir).join("labels.bin");
     let ppath = Path::new(output_dir).join("partitions.bin");
     let npath = Path::new(output_dir).join("nodes.bin");
+    let ipath = Path::new(output_dir).join("index.bin");
 
     {
         let mut vfile = BufWriter::new(fs::File::create(&vpath).expect("create vectors.bin"));
@@ -474,6 +475,17 @@ fn main() {
         }
         nfile.flush().expect("flush nodes.bin");
     }
+    {
+        let mut ifile = BufWriter::new(fs::File::create(&ipath).expect("create index.bin"));
+        write_index_file(
+            &mut ifile,
+            &records,
+            &partitions,
+            &partition_node_counts,
+            &nodes,
+        );
+        ifile.flush().expect("flush index.bin");
+    }
 
     let vsize = count * STORE_DIM * std::mem::size_of::<i16>();
     let lsize = count;
@@ -486,7 +498,57 @@ fn main() {
     eprintln!("[preprocess] wrote labels.bin  ({} bytes)", lsize);
     eprintln!("[preprocess] wrote partitions.bin ({} partitions)", PARTITIONS);
     eprintln!("[preprocess] wrote nodes.bin ({} nodes)", nodes.len());
+    eprintln!("[preprocess] wrote index.bin");
     eprintln!("[preprocess] done.");
+}
+
+fn write_index_file<W: Write>(
+    w: &mut W,
+    records: &[Record],
+    partitions: &[PartitionMeta; PARTITIONS],
+    partition_node_counts: &[u32; PARTITIONS],
+    nodes: &[KdNode],
+) {
+    let partitions_len = partition_bytes_len();
+    let nodes_len = nodes.len() * node_bytes_len();
+    let vectors_len = records.len() * STORE_DIM * std::mem::size_of::<i16>();
+    let labels_len = records.len();
+
+    let partitions_off = INDEX_FILE_HEADER_LEN as u64;
+    let nodes_off = partitions_off + partitions_len as u64;
+    let vectors_off = nodes_off + nodes_len as u64;
+    let labels_off = vectors_off + vectors_len as u64;
+    let total_len = labels_off + labels_len as u64;
+
+    w.write_all(INDEX_FILE_MAGIC).expect("write index magic");
+    write_u32(w, INDEX_VERSION);
+    write_u32(w, DIM as u32);
+    write_u32(w, STORE_DIM as u32);
+    write_u32(w, SCALE as u32);
+    write_u64(w, records.len() as u64);
+    write_u64(w, nodes.len() as u64);
+    write_u64(w, partitions_off);
+    write_u64(w, nodes_off);
+    write_u64(w, vectors_off);
+    write_u64(w, labels_off);
+    write_u64(w, total_len);
+
+    write_partitions(
+        w,
+        records.len() as u64,
+        nodes.len() as u64,
+        partitions,
+        partition_node_counts,
+    );
+    for node in nodes {
+        write_node(w, node);
+    }
+    for r in records {
+        write_qvec(w, &r.qvec);
+    }
+    for r in records {
+        w.write_all(&[r.label]).expect("write index label");
+    }
 }
 
 fn build_kd(records: &mut [Record], global_start: usize, nodes: &mut Vec<KdNode>) -> u32 {
@@ -604,6 +666,14 @@ fn write_partitions<W: Write>(
         write_qvec(w, &p.bbox_min);
         write_qvec(w, &p.bbox_max);
     }
+}
+
+const fn partition_bytes_len() -> usize {
+    8 + 4 + 8 + 8 + PARTITIONS * (4 + 4 + 4 + 4 + STORE_DIM * 2 + STORE_DIM * 2)
+}
+
+const fn node_bytes_len() -> usize {
+    STORE_DIM * 2 + STORE_DIM * 2 + 4 + 4 + 4 + 4
 }
 
 fn write_node<W: Write>(w: &mut W, node: &KdNode) {

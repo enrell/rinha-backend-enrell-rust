@@ -147,6 +147,18 @@ impl Index {
     pub fn load(data_dir: &str) -> Self {
         use std::path::Path;
 
+        if let Ok(path) = std::env::var("INDEX_PATH") {
+            let path = Path::new(&path);
+            if path.exists() {
+                return Self::load_single_file(path);
+            }
+        }
+
+        let ipath = Path::new(data_dir).join("index.bin");
+        if ipath.exists() {
+            return Self::load_single_file(&ipath);
+        }
+
         let vpath = Path::new(data_dir).join("vectors.bin");
         let lpath = Path::new(data_dir).join("labels.bin");
         let ppath = Path::new(data_dir).join("partitions.bin");
@@ -184,6 +196,48 @@ impl Index {
         Self {
             vectors: vptr_u8 as *const i16,
             labels: lptr,
+            count,
+            partitions,
+            nodes,
+        }
+    }
+
+    fn load_single_file(path: &std::path::Path) -> Self {
+        let (base, len) = load_data_file(path);
+        let data = unsafe { std::slice::from_raw_parts(base, len) };
+        let mut pos = 0usize;
+        assert!(len >= INDEX_FILE_HEADER_LEN, "index.bin too small");
+        assert_eq!(&data[..8], INDEX_FILE_MAGIC, "bad index.bin magic");
+        pos += 8;
+        assert_eq!(read_u32(data, &mut pos), INDEX_VERSION, "unsupported index version");
+        assert_eq!(read_u32(data, &mut pos), DIM as u32, "index DIM mismatch");
+        assert_eq!(read_u32(data, &mut pos), STORE_DIM as u32, "index STORE_DIM mismatch");
+        assert_eq!(read_u32(data, &mut pos), SCALE as u32, "index SCALE mismatch");
+        let count = read_u64(data, &mut pos) as usize;
+        let nodes_count = read_u64(data, &mut pos) as usize;
+        let partitions_off = read_u64(data, &mut pos) as usize;
+        let nodes_off = read_u64(data, &mut pos) as usize;
+        let vectors_off = read_u64(data, &mut pos) as usize;
+        let labels_off = read_u64(data, &mut pos) as usize;
+        let total_len = read_u64(data, &mut pos) as usize;
+        assert_eq!(total_len, len, "index.bin length mismatch");
+
+        let partitions_len = partition_bytes_len();
+        let nodes_len = nodes_count * node_bytes_len();
+        assert!(partitions_off + partitions_len <= len, "index partitions out of bounds");
+        assert!(nodes_off + nodes_len <= len, "index nodes out of bounds");
+        assert!(vectors_off + count * STORE_DIM * 2 <= len, "index vectors out of bounds");
+        assert!(labels_off + count <= len, "index labels out of bounds");
+
+        let (partitions, nodes) = parse_partition_files(
+            &data[partitions_off..partitions_off + partitions_len],
+            &data[nodes_off..nodes_off + nodes_len],
+            count,
+        );
+
+        Self {
+            vectors: unsafe { base.add(vectors_off) as *const i16 },
+            labels: unsafe { base.add(labels_off) },
             count,
             partitions,
             nodes,
@@ -398,13 +452,20 @@ fn mmap_file(path: &std::path::Path) -> Option<(*const u8, usize)> {
     use std::os::fd::AsRawFd;
 
     const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
     const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
     const MAP_POPULATE: i32 = 0x8000;
-    const MAP_HUGETLB: i32 = 0x40000;
+    const MADV_RANDOM: i32 = 1;
+    const MADV_WILLNEED: i32 = 3;
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_HUGEPAGE: i32 = 14;
     const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
     unsafe extern "C" {
         fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: isize) -> *mut c_void;
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
         fn mlock(addr: *const c_void, len: usize) -> i32;
     }
 
@@ -414,18 +475,56 @@ fn mmap_file(path: &std::path::Path) -> Option<(*const u8, usize)> {
         return None;
     }
 
-    let base_flags = MAP_PRIVATE | MAP_POPULATE;
     let wants_huge = env_true("INDEX_HUGE");
-    let mut ptr = MAP_FAILED;
-    if wants_huge {
-        ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, base_flags | MAP_HUGETLB, file.as_raw_fd(), 0) };
-    }
-    if ptr == MAP_FAILED {
-        ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, base_flags, file.as_raw_fd(), 0) };
-    }
+    let map_flags = if wants_huge {
+        MAP_PRIVATE
+    } else {
+        MAP_PRIVATE | MAP_POPULATE
+    };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, map_flags, file.as_raw_fd(), 0) };
     if ptr == MAP_FAILED {
         return None;
     }
+
+    unsafe {
+        let _ = madvise(ptr, len, MADV_RANDOM);
+        let _ = madvise(ptr, len, MADV_WILLNEED);
+    }
+
+    let ptr = if wants_huge {
+        let huge = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+                -1,
+                0,
+            )
+        };
+        if huge != MAP_FAILED {
+            unsafe {
+                let _ = madvise(huge, len, MADV_HUGEPAGE);
+                let mut off = 0usize;
+                while off < len {
+                    let chunk = (len - off).min(2 * 1024 * 1024);
+                    std::ptr::copy_nonoverlapping(ptr.cast::<u8>().add(off), huge.cast::<u8>().add(off), chunk);
+                    let _ = madvise(ptr.cast::<u8>().add(off).cast(), chunk, MADV_DONTNEED);
+                    off += chunk;
+                }
+                let _ = mprotect(huge, len, PROT_READ);
+            }
+            huge
+        } else {
+            unsafe {
+                let _ = madvise(ptr, len, MADV_HUGEPAGE);
+            }
+            ptr
+        }
+    } else {
+        ptr
+    };
+
     if env_true("INDEX_MLOCK") {
         let _ = unsafe { mlock(ptr.cast_const(), len) };
     }
@@ -503,6 +602,14 @@ fn parse_partition_files(pdata: &[u8], ndata: &[u8], count: usize) -> ([Partitio
         });
     }
     (partitions, nodes.into_boxed_slice())
+}
+
+const fn partition_bytes_len() -> usize {
+    8 + 4 + 8 + 8 + PARTITIONS * (4 + 4 + 4 + 4 + STORE_DIM * 2 + STORE_DIM * 2)
+}
+
+const fn node_bytes_len() -> usize {
+    STORE_DIM * 2 + STORE_DIM * 2 + 4 + 4 + 4 + 4
 }
 
 fn bbox_from_ptr(vdata: *const u8, count: usize) -> (QVec, QVec) {

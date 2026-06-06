@@ -4,6 +4,7 @@ services:
     image: rinha-backend-enrell-rust:local
     command: /app/lb
     platform: linux/amd64
+    cpuset: ${LB_CPUSET:-0,1,2,3}
     ports:
       - "9999:9999"
     networks:
@@ -34,19 +35,25 @@ services:
     image: rinha-backend-enrell-rust:local
     command: /app/api
     platform: linux/amd64
+    cpuset: ${API1_CPUSET:-0,1,2,3}
     networks:
       - rinha
     volumes:
       - sockets:/sockets
     environment:
       FD_PASS_PATH: /sockets/api1.sock
-      INDEX_HUGE: "true"
-      INDEX_MLOCK: "true"
+      API_WORKERS: "1"
+      INDEX_PATH: /index/index.bin
+      INDEX_HUGE: ${INDEX_HUGE:-1}
+      INDEX_MLOCK: ${INDEX_MLOCK:-1}
       INDEX_STATS: ${INDEX_STATS:-false}
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -58,19 +65,25 @@ services:
     image: rinha-backend-enrell-rust:local
     command: /app/api
     platform: linux/amd64
+    cpuset: ${API2_CPUSET:-0,1,2,3}
     networks:
       - rinha
     volumes:
       - sockets:/sockets
     environment:
       FD_PASS_PATH: /sockets/api2.sock
-      INDEX_HUGE: "true"
-      INDEX_MLOCK: "true"
+      API_WORKERS: "1"
+      INDEX_PATH: /index/index.bin
+      INDEX_HUGE: ${INDEX_HUGE:-1}
+      INDEX_MLOCK: ${INDEX_MLOCK:-1}
       INDEX_STATS: ${INDEX_STATS:-false}
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
