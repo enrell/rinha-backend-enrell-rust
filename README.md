@@ -26,17 +26,22 @@ O índice é pré-processado no build da imagem Docker:
 
 1. `references.json.gz` é descompactado no stage `indexer`.
 2. `preprocess` parseia os 3M vetores de referência.
-3. Cada vetor vira `QVec = [i16; 16]` com `SCALE = 10000`.
+3. Cada vetor vira `QVec = [i16; 16]` com `SCALE = 10000`: 14 dimensões reais mais 2 posições de padding para SIMD.
 4. Os vetores são ordenados por `partition_key` de 8 bits.
 5. Cada partição recebe uma KD/BBox tree exata.
 6. O `index.bin` runtime é gravado em layout staged: `hot4`, `mid4`, `cold8`, labels e metadados.
 7. O índice serializado é copiado para `/index/index.bin`.
 
-Arquivos gerados:
+Arquivo gerado no modo padrão:
 
 | Arquivo | Conteúdo |
 | --- | --- |
 | `index.bin` | Índice único usado em runtime via `INDEX_PATH`, com layout `hot4/mid4/cold8` |
+
+Com `WRITE_LEGACY_INDEX=1`, o preprocessador também emite arquivos separados para inspeção/debug:
+
+| Arquivo | Conteúdo |
+| --- | --- |
 | `vectors.bin` | Vetores quantizados contíguos |
 | `labels.bin` | Labels `0=legit`, `1=fraud` |
 | `partitions.bin` | Metadados das 256 partições |
@@ -63,7 +68,7 @@ O projeto não usa dependências externas. HTTP, JSON, fd-pass, epoll, mmap e SI
 | `GET` | `/ready` | `200` sem body |
 | `POST` | `/fraud-score` | `{"approved": bool, "fraud_score": number}` |
 
-Rotas desconhecidas retornam `404`.
+Rotas desconhecidas retornam `404`. Payload inválido, body ausente ou JSON não parseável em `/fraud-score` cai no fallback rápido `200 {"approved":true,"fraud_score":0.0}`.
 
 ## Build Local
 
@@ -99,7 +104,7 @@ O `docker-compose.yml` soma exatamente `1 CPU` e `350 MB`:
 | `api1` | `0.40` | `165MB` |
 | `api2` | `0.40` | `165MB` |
 
-A rede usa `bridge`, e as imagens são configuradas para `linux/amd64`.
+A rede usa `bridge`, e as imagens são configuradas para `linux/amd64`. O build usa `target-cpu=haswell` e a busca faz `assert` de AVX2 em runtime; a imagem pressupõe CPU x86_64 com AVX2.
 
 O compose deixa afinidade ampla por padrão para evitar regressões de scheduler local, mas permite fixar via env:
 
@@ -109,7 +114,23 @@ O compose deixa afinidade ampla por padrão para evitar regressões de scheduler
 | `api1` | `${API1_CPUSET:-0,1,2,3}` |
 | `api2` | `${API2_CPUSET:-0,1,2,3}` |
 
-As APIs usam `INDEX_PATH=/index/index.bin`, `INDEX_HUGE=1`, `INDEX_MLOCK=1` e `ulimits.memlock=-1`.
+Variáveis principais de runtime:
+
+| Variável | Serviço | Padrão/uso |
+| --- | --- | --- |
+| `LISTEN_ADDR` | `lb` | Endereço TCP, padrão `0.0.0.0:9999` |
+| `BACKEND_SOCKS` | `lb` | Unix sockets das APIs, separados por vírgula |
+| `FD_PASS_PATH` | `api` | Unix socket onde a API recebe file descriptors |
+| `INDEX_PATH` | `api` | Caminho do índice único, no compose `/index/index.bin` |
+| `INDEX_HUGE` | `api` | Copia o mmap para região anônima com hint de huge pages quando verdadeiro |
+| `INDEX_MLOCK` | `api` | Tenta travar o índice em memória com `mlock` quando verdadeiro |
+| `INDEX_PRIMARY_ONLY` | `api` | Se verdadeiro, busca só a partição primária |
+| `INDEX_MAX_EXTRA_PARTITIONS` | `api` | Limite de partições extras candidatas por bbox, padrão do compose `16` |
+| `INDEX_STATS` | `api` | Liga logs de estatísticas por request |
+| `MAX_CLIENTS` | `api` | Tamanho do pool de conexões por worker, padrão `1024` |
+| `DATA_DIR` | `api` | Fallback para índices separados quando `INDEX_PATH` não existe, padrão `/app/data` |
+
+As APIs usam `INDEX_PATH=/index/index.bin`, `INDEX_HUGE=1`, `INDEX_MLOCK=1` e `ulimits.memlock=-1` no compose padrão.
 
 ## Benchmarks
 
@@ -131,13 +152,7 @@ Benchmark com payloads variados, usando o checkout oficial em `../rinha-de-backe
 ./bench/run.sh mini
 ```
 
-Resultados locais observados antes desta limpeza:
-
-| Teste | Resultado |
-| --- | --- |
-| k6 oficial completo | `0` FP, `0` FN, `0` HTTP errors |
-| p99 oficial local | `~0.83ms` |
-| score local | `6000` |
+Resultados de benchmark variam bastante por host, kernel, Docker e cliente de carga. Para comparar submissões, use o `test/test.js` do repositório oficial com a imagem pública da branch `submission`; os scripts em `bench/` são auxiliares locais.
 
 ## Instrumentação
 
@@ -162,6 +177,8 @@ Cada linha `search_stats` inclui:
 | `nodes_pruned` | Nós podados por lower bound |
 | `leaves_scanned` | Folhas escaneadas |
 | `vectors_scanned` | Vetores comparados com distância exata |
+| `stage8_pruned` | Candidatos podados depois do lower bound `hot4+mid4` |
+| `full_scanned` | Candidatos que chegaram ao cálculo completo das 16 posições armazenadas |
 
 ## Submissão
 

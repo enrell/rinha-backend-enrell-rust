@@ -4,24 +4,27 @@ Rinha de Backend 2026 fraud detection challenge implemented in Rust with zero de
 
 ## Project overview
 
-Two binaries share a common fd-passing module:
+Two runtime binaries share fd-passing modules, plus a build-time index preprocessor:
 
 | Binary | Path | Role |
 |--------|------|------|
 | `lb` | `src/bin/lb.rs` | TCP load balancer (port 9999), round-robin |
 | `api` | `src/bin/api.rs` | HTTP API worker, serves fraud-score endpoint |
-| `fdpass` | `src/fdpass.rs` | Shared Unix fd-passing via `sendmsg`/`recvmsg` |
+| `preprocess` | `src/bin/preprocess.rs` | Builds the serialized vector index from `resources/references.json.gz` |
+| `fdpass_common` | `src/fdpass_common.rs` | Shared Unix fd-passing structs |
+| `fdpass_send` | `src/fdpass_send.rs` | `sendmsg` fd sender used by `lb` |
+| `fdpass_recv` | `src/fdpass_recv.rs` | `recvmsg` fd receiver used by `api` |
 
 **Architecture flow**: Client → `lb` (TCP :9999) —fd-pass over Unix socket→ `api` (serves HTTP directly on passed fd). No reverse-proxy HTTP parsing in the LB; it only round-robins raw TCP connections via fd handoff.
 
-The API currently returns a **stub response** (`{"approved":true,"fraud_score":0}`). The actual fraud detection (14-dimension vectorization + k-NN vector search against `resources/references.json.gz`) is **not yet implemented**.
+The API implements the full fraud detection pipeline: manual JSON parsing, 14-dimension vectorization, quantization to a 16-slot SIMD-friendly `QVec`, exact k-NN over the preprocessed index, and one of six precomputed JSON responses for scores `0.0` through `1.0`.
 
 ## Build & run
 
 ### Local build
 
 ```bash
-cargo build --release --bin lb --bin api
+cargo build --release --bin lb --bin api --bin preprocess
 ```
 
 ### Docker
@@ -43,11 +46,11 @@ Uses k6 with `constant-arrival-rate`. The `mini` mode needs `test-data.json` fro
 ## Runtime environment
 
 - **`lb`**: env `LISTEN_ADDR` (default `0.0.0.0:9999`), `BACKEND_SOCKS` (comma-separated Unix socket paths)
-- **`api`**: env `FD_PASS_PATH` (Unix socket path for receiving fds from lb)
+- **`api`**: env `FD_PASS_PATH` (Unix socket path for receiving fds from lb), `INDEX_PATH`, `INDEX_HUGE`, `INDEX_MLOCK`, `INDEX_PRIMARY_ONLY`, `INDEX_MAX_EXTRA_PARTITIONS`, `INDEX_STATS`, `MAX_CLIENTS`, `DATA_DIR`
 
 Docker limits (total budget: 1 CPU, 350 MB):
-- `lb`: 0.10 CPU, 16 MB
-- `api1`/`api2`: 0.45 CPU each, 167 MB each
+- `lb`: 0.20 CPU, 20 MB
+- `api1`/`api2`: 0.40 CPU each, 165 MB each
 
 Unix sockets live on a tmpfs volume (`/sockets`).
 
@@ -61,7 +64,7 @@ When adding functionality, **do not add dependencies** without careful considera
 
 ### Shared module via `#[path]`
 
-Both binaries include `src/fdpass.rs` via `#[path = "../fdpass.rs"] mod fdpass;` at the top. This is not a Cargo `[[lib]]` — it's a path-relative module inclusion. If you add shared code, follow this pattern.
+The binaries include shared modules via `#[path = "../..."]` at the top. This is not a Cargo `[[lib]]` — it's path-relative module inclusion. If you add shared code, follow this pattern.
 
 ### Rust edition 2024
 
@@ -84,15 +87,15 @@ Panic on abort means no unwinding — panics crash the process immediately.
 
 ```toml
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=haswell"]
 ```
 
-Builds target the native CPU of the builder. This means binaries built on one machine may use instructions unavailable on another. The Docker build (on CI/runner) will use the runner's CPU features. The official test runner is an old Mac Mini 2014 (x86-64), so build with compatible target if cross-compiling.
+Builds target Haswell-class x86_64. The runtime search asserts AVX2 support before loading the index.
 
 ### Epoll-based custom event loop
 
 The `api` binary uses a single-threaded epoll event loop. Connections arrive via `TAG_CONTROL` events on the Unix socket. Each accepted TCP fd is wrapped in a `Client` struct with:
-- A 16 KB buffer (`BUF_CAP`)
+- A 4 KB buffer (`BUF_CAP`)
 - Pending write tracking (`pending`, `pending_off`)
 
 The `handle_client` function does buffered HTTP parsing, routing, and non-blocking writes with partial-write retry.
@@ -109,13 +112,13 @@ When `write` returns `WouldBlock`, the response pointer and offset are saved in 
 
 Returns `true` if the client should stay registered in epoll, `false` if it should be dropped and closed. A client is kept alive as long as there's pending data to write or the buffer is still being filled.
 
-## What needs to be built
+## Fraud Detection Pipeline
 
-The fraud detection pipeline (not yet implemented) requires:
+The implemented fraud detection pipeline is:
 
 1. **Vectorization**: Transform a JSON payload into a 14-dimension float vector using normalization constants from `resources/normalization.json` and MCC risk from `resources/mcc_risk.json`. Spec in `docs/REGRAS_DE_DETECCAO.md`. Key: indices 5 and 6 get sentinel `-1` when `last_transaction` is null.
 
-2. **Vector search**: Find the 5 nearest neighbors in `resources/references.json.gz` (3M labeled vectors, 284 MB uncompressed). Any algorithm allowed (brute-force, ANN, kd-tree, etc.).
+2. **Vector search**: Find the 5 nearest neighbors in the preprocessed `index.bin` built from `resources/references.json.gz` (3M labeled vectors).
 
 3. **Decision**: `fraud_score = fraud_count_in_top5 / 5`. `approved = fraud_score < 0.6`.
 
@@ -143,6 +146,7 @@ Pre-process these at build time or startup — they don't change during the test
 ## Dockerfile notes
 
 - Two-stage: `rust:1.85-alpine` builder → `alpine:3.21` runtime
-- Only copies `Cargo.toml` and `src/` to builder — **not** `.cargo/config.toml` or `Cargo.lock`
-- Copies `resources/` to runtime image at `/app/resources/`
+- Copies `Cargo.toml`, `.cargo/config.toml` and `src/` to the builder; `Cargo.lock` is not present in this repository
+- Copies `resources/` only into the `indexer` stage
+- Builds `index.bin` in the `indexer` stage and copies only `/index/index.bin` to runtime
 - Exposes port 9999 but has no default `CMD` — the compose file provides `command`
